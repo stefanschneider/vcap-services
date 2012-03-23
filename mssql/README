@@ -1,0 +1,2 @@
+Contains the gateway for mssql (Sql Server).
+The Node is implemented in C# and running on a Windows box.

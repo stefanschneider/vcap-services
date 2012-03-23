@@ -1,5 +1,5 @@
 ---
-#cloud_controller_uri: api.vcap.me
+# cloud_controller_uri: api.vcap.me
 service:
   name: mssql
   version: "2008"
@@ -18,6 +18,13 @@ logging:
 mbus: nats://localhost:4222
 pid: /var/vcap/sys/run/mssql_service.pid
 node_timeout: 20
-# allow_over_provisioning: false
+plan_management:
+  plans:
+    free:
+      low_water: 10
+      high_water: 180
+      #allow_over_provisioning: false
+
 # z_interval: 30
-check_orphan_interval: 3600
+# check_orphan_interval: 3600
+# double_check_orphan_interval: 300
