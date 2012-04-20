@@ -16,7 +16,7 @@ describe NodeTests do
     provisioner.got_announcement.should be_true
   end
 
-  it "should call varz/healthz" do
+  it "should call varz" do
     node = nil
     provisioner = nil
     EM.run do
@@ -26,7 +26,18 @@ describe NodeTests do
       Do.at(12) { EM.stop }
     end
     node.varz_invoked.should be_true
-    node.healthz_invoked.should be_true
+  end
+
+  it "should report healthz ok" do
+    node = nil
+    provisioner = nil
+    EM.run do
+      # start provisioner then node
+      Do.at(0) { provisioner = NodeTests.create_provisioner }
+      Do.at(1) { node = NodeTests.create_node }
+      Do.at(12) { EM.stop }
+    end
+    node.healthz_ok.should == "ok\n"
   end
 
   it "should announce on request" do
@@ -269,6 +280,153 @@ describe NodeTests do
     end
     node.restore_invoked.should be_true
     provisioner.response.should =~ /Service unavailable/
+  end
+
+  it "should support disable instance" do
+    node = nil
+    provisioner = nil
+    EM.run do
+      # start node then provisioner
+      Do.at(0) { node = NodeTests.create_node }
+      Do.at(1) { provisioner = NodeTests.create_provisioner }
+      Do.at(2) { provisioner.send_disable_request }
+      Do.at(3) { EM.stop }
+    end
+    node.disable_invoked.should be_true
+  end
+
+  it "should handle error in disable instance" do
+    node = nil
+    provisioner = nil
+    EM.run do
+      # start node then provisioner
+      Do.at(0) { node = NodeTests.create_error_node }
+      Do.at(1) { provisioner = NodeTests.create_error_provisioner }
+      Do.at(2) { provisioner.send_disable_request }
+      Do.at(3) { EM.stop }
+    end
+    node.disable_invoked.should be_true
+    provisioner.response.should =~ /Service unavailable/
+  end
+
+  it "should support enable instance" do
+    node = nil
+    provisioner = nil
+    EM.run do
+      # start node then provisioner
+      Do.at(0) { node = NodeTests.create_node }
+      Do.at(1) { provisioner = NodeTests.create_provisioner }
+      Do.at(2) { provisioner.send_enable_request }
+      Do.at(3) { EM.stop }
+    end
+    node.enable_invoked.should be_true
+  end
+
+  it "should handle error in enable instance" do
+    node = nil
+    provisioner = nil
+    EM.run do
+      # start node then provisioner
+      Do.at(0) { node = NodeTests.create_error_node }
+      Do.at(1) { provisioner = NodeTests.create_error_provisioner }
+      Do.at(2) { provisioner.send_enable_request }
+      Do.at(3) { EM.stop }
+    end
+    node.enable_invoked.should be_true
+    provisioner.response.should =~ /Service unavailable/
+  end
+
+  it "should support import instance" do
+    node = nil
+    provisioner = nil
+    EM.run do
+      # start node then provisioner
+      Do.at(0) { node = NodeTests.create_node }
+      Do.at(1) { provisioner = NodeTests.create_provisioner }
+      Do.at(2) { provisioner.send_import_request }
+      Do.at(3) { EM.stop }
+    end
+    node.import_invoked.should be_true
+  end
+
+  it "should handle error in import instance" do
+    node = nil
+    provisioner = nil
+    EM.run do
+      # start node then provisioner
+      Do.at(0) { node = NodeTests.create_error_node }
+      Do.at(1) { provisioner = NodeTests.create_error_provisioner }
+      Do.at(2) { provisioner.send_import_request }
+      Do.at(3) { EM.stop }
+    end
+    node.import_invoked.should be_true
+    provisioner.response.should =~ /Service unavailable/
+  end
+
+  it "should support update instance" do
+    node = nil
+    provisioner = nil
+    EM.run do
+      # start node then provisioner
+      Do.at(0) { node = NodeTests.create_node }
+      Do.at(1) { provisioner = NodeTests.create_provisioner }
+      Do.at(2) { provisioner.send_update_request }
+      Do.at(3) { EM.stop }
+    end
+    node.update_invoked.should be_true
+  end
+
+  it "should handle error in update instance" do
+    node = nil
+    provisioner = nil
+    EM.run do
+      # start node then provisioner
+      Do.at(0) { node = NodeTests.create_error_node }
+      Do.at(1) { provisioner = NodeTests.create_error_provisioner }
+      Do.at(2) { provisioner.send_update_request }
+      Do.at(3) { EM.stop }
+    end
+    node.update_invoked.should be_true
+    provisioner.response.should =~ /Service unavailable/
+  end
+
+  it "should support cleanupnfs instance" do
+    node = nil
+    provisioner = nil
+    EM.run do
+      # start node then provisioner
+      Do.at(0) { node = NodeTests.create_node }
+      Do.at(1) { provisioner = NodeTests.create_provisioner }
+      Do.at(2) { provisioner.send_cleanupnfs_request }
+      Do.at(3) { EM.stop }
+    end
+    provisioner.got_cleanupnfs_response.should be_true
+  end
+
+  it "should decrease capacity after successful migration" do
+    node = nil
+    provisioner = nil
+    original_capacity = 0
+    EM.run do
+      Do.sec(0) { node = NodeTests.create_node; original_capacity = node.capacity }
+      Do.sec(1) { provisioner = NodeTests.create_provisioner}
+      Do.sec(2) { provisioner.send_update_request }
+      Do.sec(3) { EM.stop }
+    end
+    (original_capacity - node.capacity).should == 1
+  end
+
+  it "should not decrease capacity after erroneous migration" do
+    node = nil
+    provisioner = nil
+    original_capacity = 0
+    EM.run do
+      Do.sec(0) { node = NodeTests.create_error_node; original_capacity = node.capacity }
+      Do.sec(1) { provisioner = NodeTests.create_provisioner}
+      Do.sec(2) { provisioner.send_update_request }
+      Do.sec(3) { EM.stop }
+    end
+    (original_capacity - node.capacity).should == 0
   end
 
   it "should support check_orphan when no handles" do

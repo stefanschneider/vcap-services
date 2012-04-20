@@ -74,7 +74,7 @@ class VCAP::Services::Base::Base
   def publish(reply, msg)
     # nats publish are only allowed to be called in reactor thread.
     EM.schedule do
-      @node_nats.publish(reply, msg)
+      @node_nats.publish(reply, msg) if @node_nats
     end
   end
 
@@ -83,10 +83,6 @@ class VCAP::Services::Base::Base
     vz.each { |k,v|
       VCAP::Component.varz[k] = v
     }
-  end
-
-  def update_healthz()
-    VCAP::Component.healthz = Yajl::Encoder.encode(healthz_details, :pretty => true, :terminator => "\n")
   end
 
   def shutdown()
@@ -147,7 +143,6 @@ class VCAP::Services::Base::Base
   abstract :on_connect_node
   abstract :flavor # "Provisioner" or "Node"
   abstract :varz_details
-  abstract :healthz_details
 
   # Service Provisioner and Node classes must implement the following
   # method

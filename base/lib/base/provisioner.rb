@@ -1,5 +1,5 @@
+# -*- coding: utf-8 -*-
 # Copyright (c) 2009-2011 VMware, Inc.
-require "pp"
 require "set"
 require "datamapper"
 require "uuidtools"
@@ -14,17 +14,19 @@ require 'service_message'
 
 class VCAP::Services::Base::Provisioner < VCAP::Services::Base::Base
   include VCAP::Services::Internal
-  include VCAP::Services::AsyncJob
-  include VCAP::Services::Snapshot
+  include VCAP::Services::Base::AsyncJob
+  include VCAP::Services::Base::AsyncJob::Snapshot
 
   BARRIER_TIMEOUT = 5
   MASKED_PASSWORD = '********'
 
   def initialize(options)
     super(options)
+    @opts = options
     @version   = options[:version]
     @node_timeout = options[:node_timeout]
     @nodes     = {}
+    @provision_refs = Hash.new(0)
     @prov_svcs = {}
     @handles_for_check_orphan = {}
     @plan_mgmt = options[:plan_management] && options[:plan_management][:plans] || {}
@@ -33,13 +35,13 @@ class VCAP::Services::Base::Provisioner < VCAP::Services::Base::Base
     z_interval = options[:z_interval] || 30
 
     EM.add_periodic_timer(z_interval) do
-      update_varz; update_healthz
-    end
+      update_varz
+    end if @node_nats
 
     # Defer 5 seconds to give service a change to wake up
     EM.add_timer(5) do
-      update_varz; update_healthz
-    end
+      update_varz
+    end if @node_nats
 
     EM.add_periodic_timer(60) { process_nodes }
   end
@@ -79,16 +81,29 @@ class VCAP::Services::Base::Provisioner < VCAP::Services::Base::Base
   def find_all_bindings(name)
     res = []
     @prov_svcs.each do |k,v|
-      res << v[:credentials] if v[:credentials]["name"] == name && v[:service_id] != name
+      res << v if v[:credentials]["name"] == name && v[:service_id] != name
     end
     res
   end
 
   def process_nodes
-    @nodes.delete_if {|_, node| Time.now.to_i - node["time"] > 300}
+    @nodes.delete_if do |id, node|
+      stale = (Time.now.to_i - node["time"]) > 300
+      @provision_refs.delete(id) if stale
+      stale
+    end
   end
 
   def pre_send_announcement
+    addition_opts = @opts[:additional_options]
+    if addition_opts
+      @upload_temp_dir = addition_opts[:upload_temp_dir]
+      if addition_opts[:resque]
+        # Initial AsyncJob module
+        job_repo_setup()
+        VCAP::Services::Base::AsyncJob::Snapshot.redis_connect
+      end
+    end
   end
 
   def on_connect_node
@@ -104,7 +119,14 @@ class VCAP::Services::Base::Provisioner < VCAP::Services::Base::Base
   def on_announce(msg, reply=nil)
     @logger.debug("[#{service_description}] Received node announcement: #{msg}")
     announce_message = Yajl::Parser.parse(msg)
-    @nodes[announce_message["id"]] = announce_message.merge({"time" => Time.now.to_i}) if announce_message["id"]
+    if announce_message["id"]
+      id = announce_message["id"]
+      announce_message["time"] = Time.now.to_i
+      if @provision_refs[id] > 0
+        announce_message['available_capacity'] = @nodes[id]['available_capacity']
+      end
+      @nodes[id] = announce_message
+    end
   end
 
   # query all handles for a given instance
@@ -113,7 +135,7 @@ class VCAP::Services::Base::Provisioner < VCAP::Services::Base::Base
     if instance.empty?
       res = Yajl::Encoder.encode(@prov_svcs)
     else
-      handles = find_all_bindings(msg)
+      handles = find_all_bindings(instance)
       res = Yajl::Encoder.encode(handles)
     end
     @node_nats.publish(reply, res)
@@ -227,8 +249,8 @@ class VCAP::Services::Base::Provisioner < VCAP::Services::Base::Base
       @logger.debug("[#{service_description}] Unprovisioning instance #{instance_id} from #{node_id}")
       request = UnprovisionRequest.new
       request.name = instance_id
-      request.bindings = bindings
-      @logger.debug("[#{service_description}] Sending reqeust #{request}")
+      request.bindings = bindings.map{|h| h[:credentials]}
+      @logger.debug("[#{service_description}] Sending request #{request}")
       subscription = nil
       timer = EM.add_timer(@node_timeout) {
         @node_nats.unsubscribe(subscription)
@@ -267,49 +289,29 @@ class VCAP::Services::Base::Provisioner < VCAP::Services::Base::Base
     @logger.debug("[#{service_description}] Attempting to provision instance (request=#{request.extract})")
     subscription = nil
     plan = request.plan || "free"
-    plan_nodes = @nodes.select{ |_, node| node["plan"] == plan }
-    @logger.debug("Going to query nodes #{plan_nodes}")
+    plan_nodes = @nodes.select{ |_, node| node["plan"] == plan }.values
+    @logger.debug("Pick best nodes from: #{plan_nodes}")
     if plan_nodes.count > 0
-      barrier = VCAP::Services::Base::Barrier.new(:timeout => BARRIER_TIMEOUT, :callbacks => plan_nodes.length) do |responses|
-        @logger.debug("[#{service_description}] Found the following nodes: #{responses.inspect}")
-        @node_nats.unsubscribe(subscription)
-        provision_node(request, responses, prov_handle, blk) unless responses.empty?
-      end
-      req = Yajl::Encoder.encode({"plan" => plan})
-      subscription = @node_nats.request("#{service_name}.discover", req) {|msg| barrier.call(msg)}
-    else
-      @logger.error("Unknown plan(#{plan})")
-      blk.call(failure(ServiceError.new(ServiceError::UNKNOWN_PLAN, plan)))
-    end
-  rescue => e
-    @logger.warn("Exception at provision_service #{e}")
-    blk.call(internal_fail)
-  end
-
-  def provision_node(request, node_msgs, prov_handle, blk)
-    @logger.debug("[#{service_description}] Provisioning node (request=#{request.extract}, nnodes=#{node_msgs.length})")
-    plan = request.plan
-    nodes = node_msgs.map { |msg| Yajl::Parser.parse(msg.first) }
-    allow_over_provisioning = @plan_mgmt[plan.to_sym] && @plan_mgmt[plan.to_sym][:allow_over_provisioning] || false
-    @logger.debug("Pick best node from:  #{nodes}")
-    best_node = nodes.max_by { |node| node_score(node) }
-    if best_node && ( allow_over_provisioning || node_score(best_node) > 0 )
-      best_node = best_node["id"]
-      @logger.debug("[#{service_description}] Provisioning on #{best_node}")
-      prov_req = ProvisionRequest.new
-      prov_req.plan = plan
-      # use old credentials to provision a service if provided.
-      prov_req.credentials = prov_handle["credentials"] if prov_handle
-      subscription = nil
-      timer = EM.add_timer(@node_timeout) {
-        @node_nats.unsubscribe(subscription)
-        blk.call(timeout_fail)
-      }
-      subscription =
-        @node_nats.request(
-          "#{service_name}.provision.#{best_node}",
-          prov_req.encode
-       ) do |msg|
+      allow_over_provisioning = @plan_mgmt[plan.to_sym] && @plan_mgmt[plan.to_sym][:allow_over_provisioning] || false
+      best_node = plan_nodes.max_by { |node| node_score(node) }
+      if best_node && ( allow_over_provisioning || node_score(best_node) > 0 )
+        best_node = best_node["id"]
+        @logger.debug("[#{service_description}] Provisioning on #{best_node}")
+        prov_req = ProvisionRequest.new
+        prov_req.plan = plan
+        # use old credentials to provision a service if provided.
+        prov_req.credentials = prov_handle["credentials"] if prov_handle
+        @provision_refs[best_node] += 1
+        @nodes[best_node]['available_capacity'] -= @nodes[best_node]['capacity_unit']
+        subscription = nil
+        timer = EM.add_timer(@node_timeout) {
+          @provision_refs[best_node] -= 1
+          @node_nats.unsubscribe(subscription)
+          blk.call(timeout_fail)
+        }
+        subscription =
+          @node_nats.request("#{service_name}.provision.#{best_node}", prov_req.encode) do |msg|
+          @provision_refs[best_node] -= 1
           EM.cancel_timer(timer)
           @node_nats.unsubscribe(subscription)
           response = ProvisionResponse.decode(msg)
@@ -328,11 +330,18 @@ class VCAP::Services::Base::Provisioner < VCAP::Services::Base::Base
             blk.call(wrap_error(response))
           end
         end
+      else
+        # No resources
+        @logger.warn("[#{service_description}] Could not find a node to provision")
+        blk.call(internal_fail)
+      end
     else
-      # No resources
-      @logger.warn("[#{service_description}] Could not find a node to provision")
-      blk.call(internal_fail)
+      @logger.error("Unknown plan(#{plan})")
+      blk.call(failure(ServiceError.new(ServiceError::UNKNOWN_PLAN, plan)))
     end
+  rescue => e
+    @logger.warn("Exception at provision_service #{e}")
+    blk.call(internal_fail)
   end
 
   def bind_instance(instance_id, binding_options, bind_handle=nil, &blk)
@@ -567,6 +576,91 @@ class VCAP::Services::Base::Provisioner < VCAP::Services::Base::Base
     blk.call(internal_fail)
   end
 
+  def migrate_instance(node_id, instance_id, action, &blk)
+    @logger.debug("[#{service_description}] Attempting to #{action} instance #{instance_id} in node #{node_id}")
+
+    begin
+      svc = @prov_svcs[instance_id]
+      raise ServiceError.new(ServiceError::NOT_FOUND, instance_id) if svc.nil?
+
+      binding_handles = []
+      @prov_svcs.each do |_, handle|
+        if handle[:service_id] != instance_id
+          binding_handles << handle if handle[:credentials]["name"] == instance_id
+        end
+      end
+      subscription = nil
+      message = nil
+      channel = nil
+      if action == "disable" || action == "enable" || action == "import" || action == "update" || action == "cleanupnfs"
+        channel = "#{service_name}.#{action}_instance.#{node_id}"
+        message = Yajl::Encoder.encode([svc, binding_handles])
+      elsif action == "unprovision"
+        channel = "#{service_name}.unprovision.#{node_id}"
+        bindings = find_all_bindings(instance_id)
+        request = UnprovisionRequest.new
+        request.name = instance_id
+        request.bindings = bindings
+        message = request.encode
+      elsif action == "check"
+        if node_id == svc[:credentials]["node_id"]
+          blk.call(success())
+          return
+        else
+          raise ServiceError.new(ServiceError::NOT_FOUND, instance_id)
+        end
+      else
+        raise ServiceError.new(ServiceError::NOT_FOUND, action)
+      end
+      timer = EM.add_timer(@node_timeout) {
+        @node_nats.unsubscribe(subscription)
+        blk.call(timeout_fail)
+      }
+      subscription = @node_nats.request(channel, message) do |msg|
+        EM.cancel_timer(timer)
+        @node_nats.unsubscribe(subscription)
+        if action != "update"
+          response = SimpleResponse.decode(msg)
+          if response.success
+            blk.call(success())
+          else
+            blk.call(wrap_error(response))
+          end
+        else
+          handles = Yajl::Parser.parse(msg)
+          handles.each do |handle|
+            @update_handle_callback.call(handle) do |update_res|
+              if update_res
+                @logger.info("Migration: success to update handle: #{handle}")
+              else
+                @logger.error("Migration: failed to update handle: #{handle}")
+                blk.call(wrap_error(response))
+              end
+            end
+            blk.call(success())
+          end
+        end
+      end
+    rescue => e
+      if e.instance_of? ServiceError
+        blk.call(failure(e))
+      else
+        @logger.warn("Exception at migrate_instance #{e}")
+        blk.call(internal_fail)
+      end
+    end
+  end
+
+  def get_instance_id_list(node_id, &blk)
+    @logger.debug("Get instance id list for migration")
+
+    id_list = []
+    @prov_svcs.each do |k, v|
+      id_list << k if (k == v[:credentials]["name"] && node_id == v[:credentials]["node_id"])
+    end
+    blk.call(success(id_list))
+  end
+
   # Create a create_snapshot job and return the job object.
   #
   def create_snapshot(service_id, &blk)
@@ -629,6 +723,21 @@ class VCAP::Services::Base::Provisioner < VCAP::Services::Base::Base
                   :node_id => find_node(service_id))
     job = get_job(job_id)
     @logger.info("RoallbackSnapshotJob created: #{job.inspect}")
+    blk.call(success(job))
+  rescue => e
+    handle_error(e, &blk)
+  end
+
+  def delete_snapshot(service_id, snapshot_id, &blk)
+    @logger.debug("Delete snapshot=#{snapshot_id} for service_id=#{service_id}")
+    svc = @prov_svcs[service_id]
+    raise ServiceError.new(ServiceError::NOT_FOUND, service_id) unless svc
+    snapshot = snapshot_details(service_id, snapshot_id)
+    raise ServiceError.new(ServiceError::NOT_FOUND, snapshot_id) unless snapshot
+    job_id = delete_snapshot_job.create(:service_id => service_id, :snapshot_id => snapshot_id,
+                  :node_id => find_node(service_id))
+    job = get_job(job_id)
+    @logger.info("DeleteSnapshotJob created: #{job.inspect}")
     blk.call(success(job))
   rescue => e
     handle_error(e, &blk)
@@ -736,7 +845,8 @@ class VCAP::Services::Base::Provisioner < VCAP::Services::Base::Base
         :plan => plan,
         :score => score,
         :low_water => v[:low_water],
-        :high_water => v[:high_water]
+        :high_water => v[:high_water],
+        :allow_over_provisioning => v[:allow_over_provisioning]?1:0
       }
     end
 
@@ -750,12 +860,6 @@ class VCAP::Services::Base::Provisioner < VCAP::Services::Base::Base
     return varz
   rescue => e
     @logger.warn("Exception at varz_details #{e}")
-  end
-
-  def healthz_details()
-    healthz = {
-      :self => "ok"
-    }
   end
 
   ########
@@ -786,7 +890,7 @@ class VCAP::Services::Base::Provisioner < VCAP::Services::Base::Base
 
   # handle request exception
   def handle_error(e, &blk)
-    @logger.warn("Exception at handle_error #{e}")
+    @logger.warn("Exception at handle_error #{e}:"+"[#{e.backtrace.join("|")}]")
     if e.instance_of? ServiceError
       blk.call(failure(e))
     else
@@ -819,6 +923,6 @@ class VCAP::Services::Base::Provisioner < VCAP::Services::Base::Base
   #
 
   # various lifecycle jobs class
-  abstract :create_snapshot_job, :rollback_snapshot_job, :create_serialized_url_job, :import_from_url_job, :import_from_data_job
+  abstract :create_snapshot_job, :rollback_snapshot_job, :delete_snapshot_job, :create_serialized_url_job, :import_from_url_job, :import_from_data_job
 
 end
