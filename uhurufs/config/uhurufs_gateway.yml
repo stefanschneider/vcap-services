@@ -17,7 +17,7 @@ logging:
   level: debug
 mbus: nats://localhost:4222
 pid: /var/vcap/sys/run/uhurufs_service.pid
-node_timeout: 2
+node_timeout: 20
 plan_management:
   plans:
     free:
